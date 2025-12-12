@@ -2,44 +2,31 @@
 """
 generate_chapters.py
 
-Full, self-contained generator for one chapter per run.
+Clean, HF-text-generation-only generator.
 
-Features:
-- Hybrid autodetect: probes provider capability and uses the appropriate call style.
-- Supports text-generation and conversational/chat providers with robust fallbacks.
-- MOCK_MODE for safe testing (no HF calls).
+Behavior:
+- Uses the Hugging Face Inference API (HTTP) with JSON payload {"inputs": ..., "parameters": {...}}.
+- No probing. No conversational fallback. Uses the documented text-generation contract.
+- MOCK_MODE for safe testing (no network calls).
 - Reads model and languages from generator/config.yaml.
-- Writes Markdown to output/<LanguageTitleCase>/<ChapterTitle>.md
-- Appends completed languages to completed_languages.txt (unless MOCK_MODE).
-- Clear Action-friendly logging, retries, and safe commits-ready outputs.
-
-Environment variables:
-- HF_API_TOKEN         (required for non-mock runs)
-- HF_MODEL             (optional; falls back to config.yaml model)
-- PREVIEW_LANGUAGE     (optional; forces that language instead of picking next)
-- MOCK_MODE            ("true"/"1"/"yes" toggles mock)
-- MAX_RETRIES          (default 5)
-- INITIAL_BACKOFF      (seconds, default 2.0)
-- OUTDIR               (optional override; default ./output)
+- Writes Markdown to output/<TitleCaseLanguage>/<ChapterTitle>.md
+- Appends completed languages (unless MOCK_MODE).
+- Retry/backoff for rate limits and transient errors.
 """
+
 from __future__ import annotations
 
 import os
 import sys
 import time
 import random
-import yaml
 import json
+import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, List, Set
+from typing import Any, Dict, Optional, Set
 
-# Optional imports for huggingface_hub
-try:
-    from huggingface_hub import InferenceClient, HfApi
-except Exception:
-    InferenceClient = None
-    HfApi = None  # Metadata probe will skip if unavailable
+import requests
 
 # ---------- CONFIG PATHS ----------
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,27 +53,11 @@ PREVIEW_LANGUAGE = os.environ.get("PREVIEW_LANGUAGE", "").strip() or None
 MOCK_MODE = str(os.environ.get("MOCK_MODE", "false")).lower() in ("1", "true", "yes")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 5))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", 2.0))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", 60))
 
 if not MOCK_MODE and not HF_TOKEN:
     print("ERROR: HF_API_TOKEN is required for non-mock runs.", file=sys.stderr)
     sys.exit(2)
-
-# ---------- HF CLIENT ----------
-client = None
-hf_api = None
-if not MOCK_MODE:
-    if InferenceClient is None:
-        raise RuntimeError("huggingface_hub is not installed. Please pip install --upgrade huggingface_hub")
-    try:
-        client = InferenceClient(token=HF_TOKEN)
-    except Exception as e:
-        print(f"ERROR: Failed to initialize InferenceClient: {e}", file=sys.stderr)
-        raise
-    try:
-        if HfApi is not None:
-            hf_api = HfApi()
-    except Exception:
-        hf_api = None
 
 # ---------- HELPERS ----------
 def read_completed() -> Set[str]:
@@ -116,7 +87,6 @@ def safe_filename(s: str) -> str:
     return keep[:200]
 
 def language_folder_titlecase(language: str) -> str:
-    # Create Title Case folder (e.g., "python" -> "Python", "c++" -> "C++")
     if not language:
         return "Unknown"
     return language[0].upper() + language[1:]
@@ -149,78 +119,42 @@ def build_prompt_for_chapter(language: str, chapter_meta: Dict[str, Any]) -> str
         "- For code examples: include line-by-line commentary as inline comments or adjacent explanation.\n"
         "- Provide 2-3 practical exercises and hide answers in collapsible sections.\n"
         "- End with a concise recap and recommended next steps.\n"
-        "- Do NOT include any meta-text about prompts, 'as an AI', or internal tool details.\n"
-        "- Output must be valid Markdown and suitable for Obsidian (YAML frontmatter + headings).\n\n"
+        "- Do NOT include any meta-text about prompts, 'as an AI', or internal tool details.\n\n"
     )
     footer = "\n\n<!-- Begin chapter content -->\n\n"
     prompt = f"{fm_yaml}# {title}\n\n{guidance}{footer}"
     return prompt
 
-# ---------- PROVIDER PROBE (hybrid autodetect) ----------
-def probe_provider_support(timeout_sec: int = 6) -> str:
+# ---------- HF HTTP CALL (text-generation only) ----------
+def hf_textgen_http(prompt: str, max_new_tokens: int = 300, temperature: float = 0.2) -> Dict[str, Any]:
     """
-    Probe the model/provider to detect whether 'text-generation' or 'conversational' is supported.
-    Returns one of: 'text-generation', 'conversational', or 'unknown'
+    Call Hugging Face Inference API via HTTP POST using the text-generation contract:
+    { "inputs": "...", "parameters": {...} }
+    Returns parsed JSON response.
+    Raises requests.HTTPError on non-2xx status.
     """
-    # 1) Try model metadata via HfApi if available
-    try:
-        if hf_api is not None:
-            info = hf_api.model_info(HF_MODEL, token=HF_TOKEN)
-            pipeline_tag = getattr(info, "pipeline_tag", None)
-            if pipeline_tag:
-                pt = pipeline_tag.lower()
-                if "text-generation" in pt or "text_generation" in pt or "textgen" in pt:
-                    return "text-generation"
-                if "conversational" in pt or "chat" in pt:
-                    return "conversational"
-    except Exception:
-        # ignore metadata probe failures; we'll try runtime probe
-        pass
+    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+        },
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+    # raise for HTTP errors (401/403/404 etc.)
+    resp.raise_for_status()
+    return resp.json()
 
-    # 2) Runtime lightweight probe: attempt a very tiny text_generation call
-    if client is None:
-        return "unknown"
-    try:
-        # Use a tiny prompt and set a low timeout via the client if supported
-        try:
-            probe_resp = client.text_generation(model=HF_MODEL, inputs="Hello", max_new_tokens=1, temperature=0.0)
-            # If we get a result, assume text-generation supported
-            if probe_resp is not None:
-                return "text-generation"
-        except Exception as e:
-            msg = str(e).lower()
-            if "conversational" in msg or "task" in msg and "conversational" in msg:
-                return "conversational"
-            # provider-specific messages may vary; continue to chat probe
-    except Exception:
-        pass
-
-    # 3) Try a tiny conversational call to see if that works
-    try:
-        if hasattr(client, "chat"):
-            try:
-                chat_resp = client.chat(model=HF_MODEL, messages=[{"role":"user","content":"hi"}], max_new_tokens=1)
-                if chat_resp is not None:
-                    return "conversational"
-            except Exception:
-                pass
-        if hasattr(client, "conversational"):
-            try:
-                conv_resp = client.conversational(model=HF_MODEL, inputs="hi")
-                if conv_resp is not None:
-                    return "conversational"
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return "unknown"
-
-# ---------- MODEL CALLER (hybrid autodetect + robust fallbacks) ----------
+# ---------- CALL MODEL (retries/backoff) ----------
 def call_model(prompt: str, max_tokens: int = 1500, temperature: float = 0.2) -> Dict[str, str]:
     """
-    Hybrid caller: uses provider probe to choose the best API, with robust fallbacks.
-    Returns {'content': <string>}.
+    Text-generation-only caller via HF HTTP endpoint. Returns {'content': <text>}.
+    Retries on rate/timeout; raises for auth/model-not-found errors.
     """
     if MOCK_MODE:
         content = (
@@ -230,146 +164,80 @@ def call_model(prompt: str, max_tokens: int = 1500, temperature: float = 0.2) ->
         )
         return {"content": content}
 
-    # Probe what the provider supports (cached per run)
-    provider_mode = probe_provider_support()
-    print(f"[HF_CALL] Provider probe suggests: {provider_mode}")
-
     backoff = INITIAL_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = None
-
-            # Decide primary method
-            primary_try_text = provider_mode != "conversational"
-
-            # First attempt: text-generation (if sensible)
-            if primary_try_text:
-                try:
-                    resp = client.text_generation(model=HF_MODEL, inputs=prompt, max_new_tokens=max_tokens, temperature=temperature, do_sample=False)
-                except TypeError:
-                    # try alternate signature
-                    try:
-                        resp = client.text_generation(model=HF_MODEL, prompt=prompt, max_new_tokens=max_tokens, temperature=temperature, do_sample=False)
-                    except Exception as e:
-                        msg = str(e).lower()
-                        if "conversational" in msg or "task" in msg and "conversational" in msg:
-                            resp = None
-                        else:
-                            raise
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "conversational" in msg or ("task" in msg and "conversational" in msg):
-                        resp = None
-                    elif any(tok in msg for tok in ("401", "repository not found", "permission", "invalid username")):
-                        raise
-                    else:
-                        raise
-
-            # If text-generation not used or failed, try chat/conversational
-            if resp is None:
-                tried = []
-                if hasattr(client, "chat"):
-                    tried.append("chat")
-                    try:
-                        resp = client.chat(model=HF_MODEL, messages=[{"role":"system","content":"You are a concise, helpful teacher."},{"role":"user","content":prompt}], max_new_tokens=max_tokens)
-                    except Exception:
-                        resp = None
-                if resp is None and hasattr(client, "conversational"):
-                    tried.append("conversational")
-                    try:
-                        resp = client.conversational(model=HF_MODEL, inputs=prompt)
-                    except Exception:
-                        resp = None
-                if resp is None and hasattr(client, "generate"):
-                    tried.append("generate")
-                    try:
-                        resp = client.generate(model=HF_MODEL, prompt=prompt, max_new_tokens=max_tokens)
-                    except Exception:
-                        resp = None
-
-                if resp is None:
-                    raise RuntimeError(f"No supported generation method succeeded. Tried: {tried}")
-
-            # Normalize
+            data = hf_textgen_http(prompt, max_new_tokens=max_tokens, temperature=temperature)
+            # HF commonly returns either a list of dicts or a dict
             text = ""
-            if isinstance(resp, list) and resp:
-                first = resp[0]
+            if isinstance(data, list) and len(data) > 0:
+                first = data[0]
                 if isinstance(first, dict):
+                    # common key: 'generated_text'
                     text = first.get("generated_text") or first.get("text") or first.get("content") or str(first)
                 else:
                     text = str(first)
-            elif isinstance(resp, dict):
-                if "choices" in resp and isinstance(resp["choices"], list) and resp["choices"]:
-                    choice = resp["choices"][0]
-                    if isinstance(choice, dict):
-                        msg = choice.get("message") or {}
-                        if isinstance(msg, dict) and msg.get("content"):
-                            text = msg.get("content")
-                        else:
-                            text = choice.get("text") or choice.get("generated_text") or str(choice)
-                    else:
-                        text = str(choice)
-                elif "generated_text" in resp or "text" in resp or "content" in resp:
-                    text = resp.get("generated_text") or resp.get("text") or resp.get("content") or str(resp)
-                elif "results" in resp and isinstance(resp["results"], list) and resp["results"]:
-                    first = resp["results"][0]
+            elif isinstance(data, dict):
+                # Some models return {'generated_text': '...'} or {'text': '...'}
+                if "generated_text" in data or "text" in data or "content" in data:
+                    text = data.get("generated_text") or data.get("text") or data.get("content") or str(data)
+                elif "results" in data and isinstance(data["results"], list) and data["results"]:
+                    first = data["results"][0]
                     if isinstance(first, dict):
                         text = first.get("generated_text") or first.get("text") or first.get("content") or str(first)
                     else:
                         text = str(first)
                 else:
-                    text = str(resp)
-            elif hasattr(resp, "generated_text"):
-                text = getattr(resp, "generated_text")
-            elif hasattr(resp, "results"):
-                try:
-                    results = getattr(resp, "results")
-                    if isinstance(results, list) and results:
-                        first = results[0]
-                        if isinstance(first, dict):
-                            text = first.get("generated_text") or first.get("text") or first.get("content") or str(first)
-                        else:
-                            text = str(first)
-                    else:
-                        text = str(resp)
-                except Exception:
-                    text = str(resp)
+                    # fallback: stringify
+                    text = str(data)
             else:
-                text = str(resp)
+                text = str(data)
 
             if not isinstance(text, str):
                 text = str(text)
             return {"content": text}
 
-        except Exception as e:
-            err_str = str(e)
-            print(f"[HF_CALL][attempt {attempt}/{MAX_RETRIES}] Exception: {err_str}", file=sys.stderr)
-            lower = err_str.lower()
-            if any(tok in lower for tok in ("401", "repository not found", "invalid username", "permission", "forbidden")):
+        except requests.HTTPError as http_err:
+            status = getattr(http_err.response, "status_code", None)
+            msg = str(http_err).lower()
+            print(f"[HF_HTTP][attempt {attempt}/{MAX_RETRIES}] HTTP error ({status}): {msg}", file=sys.stderr)
+            # Fatal: auth or model-not-found
+            if status in (401, 403, 404):
                 raise
-            if any(tok in lower for tok in ("rate", "limit", "429", "throttle", "retry", "quota")):
+            # Retryable statuses (429, 500, 502, 503)
+            if status in (429, 500, 502, 503):
                 sleep_time = backoff + random.random()
-                print(f"[HF_CALL] Rate/limit hit, sleeping {sleep_time:.1f}s before retry...", file=sys.stderr)
+                print(f"[HF_HTTP] Retryable HTTP status {status}, sleeping {sleep_time:.1f}s...", file=sys.stderr)
                 time.sleep(sleep_time)
                 backoff *= 2
                 continue
-            if any(tok in lower for tok in ("timeout", "connection", "temporarily unavailable", "503", "service unavailable")):
-                sleep_time = backoff + random.random()
-                print(f"[HF_CALL] Transient error; sleeping {sleep_time:.1f}s before retry...", file=sys.stderr)
-                time.sleep(sleep_time)
-                backoff *= 2
-                continue
+            # Other HTTP statuses: re-raise
             raise
-
-    raise RuntimeError("Max retries reached while calling model")
+        except requests.RequestException as e:
+            msg = str(e).lower()
+            print(f"[HF_HTTP][attempt {attempt}/{MAX_RETRIES}] RequestException: {msg}", file=sys.stderr)
+            if any(tok in msg for tok in ("timeout", "connection", "temporarily unavailable", "503")):
+                sleep_time = backoff + random.random()
+                print(f"[HF_HTTP] Transient network error, sleeping {sleep_time:.1f}s...", file=sys.stderr)
+                time.sleep(sleep_time)
+                backoff *= 2
+                continue
+            # For other request errors, retry a few times then raise
+            sleep_time = backoff + random.random()
+            print(f"[HF_HTTP] Unknown request error, sleeping {sleep_time:.1f}s...", file=sys.stderr)
+            time.sleep(sleep_time)
+            backoff *= 2
+            continue
+    raise RuntimeError("Max retries reached while calling HF Inference HTTP API")
 
 # ---------- CORE GENERATION ----------
 def generate_for_language(language: str) -> Path:
     chapter_meta = {"title": "Introduction", "notes": "Auto-generated one-chapter run"}
     prompt = build_prompt_for_chapter(language, chapter_meta)
     print(f"[GEN] Sending prompt for language='{language}' (prompt length {len(prompt)} chars)...")
-    resp = call_model(prompt)
+    resp = call_model(prompt, max_tokens=1200, temperature=0.2)
     md = resp.get("content", "")
+    # Ensure frontmatter exists
     if not md.strip().startswith("---"):
         md = prompt + md
     path = save_markdown(language, chapter_meta["title"], md)
