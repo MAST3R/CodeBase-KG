@@ -19,7 +19,7 @@ retry:
 
 # Mock mode (for CI dry-runs and debugging)
 mock_mode:
-  enabled: true
+  enabled: false
   sample_output_path: "generator/mock/mock_output.md"
 
 # Small language handling
