@@ -2,12 +2,22 @@ name: Generate Encyclopedia
 
 on:
   schedule:
-    - cron: '0 2 * * *' # daily at 02:00 UTC (adjust schedule in repo settings if needed)
-  workflow_dispatch: {}
+    - cron: '0 2 * * *'   # daily run
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Language to generate (leave empty for automatic next language)"
+        required: false
+        default: ""
+      mock:
+        description: "Enable mock mode? (true/false)"
+        required: false
+        default: "false"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,10 +32,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install openai pyyaml
 
-      - name: Run generator (mock mode optional)
+      - name: Run generator
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FORCE_LANGUAGE: ${{ inputs.language }}
+          MOCK_MODE: ${{ inputs.mock }}
         run: |
+          echo "FORCE_LANGUAGE=$FORCE_LANGUAGE"
+          echo "MOCK_MODE=$MOCK_MODE"
           python generator/generate.py
 
       - name: Commit generated output
@@ -35,8 +49,8 @@ jobs:
           git add output || true
           git add completed_languages || true
           if ! git diff --staged --quiet; then
-            git commit -m "chore: add generated language output [skip ci]" || true
-            git push origin HEAD:$(git rev-parse --abbrev-ref HEAD)
+            git commit -m "chore: add generated encyclopedia output [skip ci]" || true
+            git push origin HEAD:${{ github.ref }}
           else
             echo "No changes to commit"
           fi
