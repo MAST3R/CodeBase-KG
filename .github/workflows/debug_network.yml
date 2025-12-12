@@ -1,15 +1,11 @@
 name: Groq + Gemini Debug Runner
 
-# Having workflow_dispatch gives you the "Run workflow" button in the Actions UI.
 on:
-  workflow_dispatch:
-    inputs:
-      quick:
-        description: 'Quick run (skip heavy deps install)'
-        required: false
-        default: 'false'
+  workflow_dispatch: {}
   push:
-    branches: [ "main", "deploy" ]
+    branches:
+      - main
+      - deploy
 
 concurrency:
   group: groq-gemini-debug
@@ -18,7 +14,6 @@ concurrency:
 permissions:
   contents: read
   actions: read
-  # adjust permissions as needed for other parts of your workflow
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -31,7 +26,6 @@ jobs:
     name: Debug Groq/Gemini (safe apt + DNS checks)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,11 +39,8 @@ jobs:
           free -m
 
       - name: Prepare safe apt-get (retry + unlock) and update
-        # This step uses sudo where required and defends against stale locks by retrying and
-        # removing leftover lockfiles only if they exist. This is safer than failing early.
         run: |
           set -eux
-          # retry helper
           retry_cmd() {
             local i max=5; for i in $(seq 1 $max); do
               "$@" && break
@@ -57,14 +48,10 @@ jobs:
               sleep $((i*2))
             done
           }
-
-          # Remove stale locks if present (common cause of E: Could not open lock file)
           sudo bash -c 'if [ -f /var/lib/apt/lists/lock ]; then rm -f /var/lib/apt/lists/lock; fi'
           sudo bash -c 'if [ -f /var/cache/apt/archives/lock ]; then rm -f /var/cache/apt/archives/lock; fi'
           sudo bash -c 'if [ -f /var/lib/dpkg/lock-frontend ]; then rm -f /var/lib/dpkg/lock-frontend; fi'
           sudo bash -c 'dpkg --configure -a || true'
-
-          # Use apt-get with retries and reduced Acquire::Retries to reduce transient failures
           sudo bash -c 'DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y'
 
       - name: Install basic debug utilities (curl, git, python deps)
@@ -90,9 +77,8 @@ jobs:
       - name: DNS + connectivity checks (fast, no extra apt)
         run: |
           set -eux
-          echo "Resolve groq domain via python socket (no extra package required)"
           python - <<'PY'
-import socket, sys
+import socket
 hosts = ["api.groq.ai", "groq.ai", "www.google.com"]
 for h in hosts:
     try:
@@ -101,7 +87,6 @@ for h in hosts:
     except Exception as e:
         print(f"{h} resolution failed: {e}")
 PY
-          echo "HTTP check to example endpoints (with retries)"
           curl --fail --retry 5 --retry-delay 2 -I https://api.groq.ai || echo "api.groq.ai might not respond to HEAD"
 
       - name: Run your Groq generator (capture stdout/stderr)
@@ -110,23 +95,14 @@ PY
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -eux
-          # make a logs folder so we can upload everything
           mkdir -p debug-logs
           timestamp=$(date -u +"%Y%m%dT%H%M%SZ")
           LOGFILE=debug-logs/groq-generate-$timestamp.log
-
-          # Defensive invocation: export envs and run with retries
-          export GROQ_API_KEY="${GROQ_API_KEY:-}"
-          export GEMINI_API_KEY="${GEMINI_API_KEY:-}"
           echo "Starting generator at $(date -u)" | tee -a "$LOGFILE"
-
-          # If your script needs specific venv or interpreter flags, adjust here
           if [ -f generator/groq_generate.py ]; then
-            # run with a retry wrapper because network/DNS issues can be transient
             n=0
             max=3
-            until [ $n -ge $max ]
-            do
+            until [ $n -ge $max ]; do
               python generator/groq_generate.py 2>&1 | tee -a "$LOGFILE" && break
               n=$((n+1))
               echo "groq_generate try $n/$max failed, sleeping before retry" | tee -a "$LOGFILE"
@@ -157,6 +133,7 @@ PY
 
       - name: Upload debug logs as artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ env.DEBUG_ARTIFACT_NAME }}
           path: |
