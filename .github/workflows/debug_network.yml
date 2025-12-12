@@ -1,11 +1,15 @@
 name: Groq + Gemini Debug Runner
 
+# Top-level manual trigger — this is what creates the "Run workflow" button
 on:
   workflow_dispatch: {}
-  push:
-    branches:
-      - main
-      - deploy
+
+# Optional: keep push triggers if you want CI runs on push too
+# on:
+#   push:
+#     branches:
+#       - main
+#       - deploy
 
 concurrency:
   group: groq-gemini-debug
@@ -26,55 +30,38 @@ jobs:
     name: Debug Groq/Gemini (safe apt + DNS checks)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Print runner info (for debugging)
+      - name: Runner info
         run: |
-          echo "Runner: $RUNNER_OS / $RUNNER_TEMP"
-          lsb_release -a || true
+          echo "Runner: $RUNNER_OS"
           uname -a
-          df -h
-          free -m
+          lsb_release -a || true
 
-      - name: Prepare safe apt-get (retry + unlock) and update
+      - name: Safe apt-get update (with sudo and stale-lock removal)
         run: |
           set -eux
-          retry_cmd() {
-            local i max=5; for i in $(seq 1 $max); do
-              "$@" && break
-              echo "Command failed (attempt $i/$max): $*"
-              sleep $((i*2))
-            done
-          }
-          sudo bash -c 'if [ -f /var/lib/apt/lists/lock ]; then rm -f /var/lib/apt/lists/lock; fi'
-          sudo bash -c 'if [ -f /var/cache/apt/archives/lock ]; then rm -f /var/cache/apt/archives/lock; fi'
-          sudo bash -c 'if [ -f /var/lib/dpkg/lock-frontend ]; then rm -f /var/lib/dpkg/lock-frontend; fi'
+          # remove stale locks if present
+          sudo bash -c 'for f in /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend; do if [ -f "$f" ]; then rm -f "$f"; fi; done'
           sudo bash -c 'dpkg --configure -a || true'
-          sudo bash -c 'DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y'
+          # run update with reduced retries
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y
 
-      - name: Install basic debug utilities (curl, git, python deps)
+      - name: Install minimal debug tools
         run: |
           set -eux
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl git build-essential
-          python3 -m pip install --upgrade pip
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl git
+          python3 -m pip install --upgrade pip setuptools wheel
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies (if requirements.txt present)
-        run: |
-          set -eux
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          else
-            echo "No requirements.txt found — skipping pip install"
-          fi
-
-      - name: DNS + connectivity checks (fast, no extra apt)
+      - name: DNS and quick connectivity checks
         run: |
           set -eux
           python - <<'PY'
@@ -82,14 +69,13 @@ import socket
 hosts = ["api.groq.ai", "groq.ai", "www.google.com"]
 for h in hosts:
     try:
-        ip = socket.gethostbyname(h)
-        print(f"{h} -> {ip}")
+        print(h, "->", socket.gethostbyname(h))
     except Exception as e:
-        print(f"{h} resolution failed: {e}")
+        print(h, "resolution failed:", e)
 PY
-          curl --fail --retry 5 --retry-delay 2 -I https://api.groq.ai || echo "api.groq.ai might not respond to HEAD"
+          curl --fail --retry 3 --retry-delay 2 -I https://api.groq.ai || echo "api.groq.ai HEAD check failed or blocked"
 
-      - name: Run your Groq generator (capture stdout/stderr)
+      - name: Run groq generator (defensive, write logs)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -98,15 +84,14 @@ PY
           mkdir -p debug-logs
           timestamp=$(date -u +"%Y%m%dT%H%M%SZ")
           LOGFILE=debug-logs/groq-generate-$timestamp.log
-          echo "Starting generator at $(date -u)" | tee -a "$LOGFILE"
+          echo "Start: $(date -u)" | tee -a "$LOGFILE"
           if [ -f generator/groq_generate.py ]; then
-            n=0
-            max=3
+            n=0; max=3
             until [ $n -ge $max ]; do
               python generator/groq_generate.py 2>&1 | tee -a "$LOGFILE" && break
               n=$((n+1))
-              echo "groq_generate try $n/$max failed, sleeping before retry" | tee -a "$LOGFILE"
-              sleep $((n * 5))
+              echo "Attempt $n/$max failed" | tee -a "$LOGFILE"
+              sleep $((n*5))
             done
             if [ $n -ge $max ]; then
               echo "groq_generate failed after $max attempts" | tee -a "$LOGFILE"
@@ -118,20 +103,16 @@ PY
             exit 2
           fi
 
-      - name: Collect environment + network debug info
+      - name: Collect debug info
         run: |
           set -eux
           echo "--- ENV (filtered) ---" > debug-logs/env.txt
           env | egrep -i 'GROQ|GEMINI|HTTP|HTTPS|PROXY|DNS|HOST' >> debug-logs/env.txt || true
-          echo "--- netstat ---" > debug-logs/netstat.txt
-          ss -tunap || true
-          echo "--- resolv.conf ---" > debug-logs/resolv.txt
-          cat /etc/resolv.conf >> debug-logs/resolv.txt || true
-          echo "--- apt state ---" > debug-logs/apt-state.txt
-          sudo bash -c 'apt-cache policy || true' >> debug-logs/apt-state.txt || true
+          cat /etc/resolv.conf > debug-logs/resolv.txt || true
+          ss -tunap > debug-logs/ss.txt || true
           tar -czf debug-logs.tar.gz debug-logs || true
 
-      - name: Upload debug logs as artifact
+      - name: Upload debug logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -139,8 +120,3 @@ PY
           path: |
             debug-logs
             debug-logs.tar.gz
-
-      - name: Final status
-        if: ${{ failure() }}
-        run: |
-          echo "Workflow failed — logs uploaded as artifact named $DEBUG_ARTIFACT_NAME"
