@@ -1,0 +1,113 @@
+name: Groq + Gemini Debug Runner (full)
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: groq-gemini-debug
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  DEBUG_ARTIFACT_NAME: groq-gemini-debug-logs
+
+jobs:
+  debug:
+    name: Debug Groq/Gemini (safe apt + DNS checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          echo "Runner: $RUNNER_OS"
+          uname -a
+          lsb_release -a || true
+
+      - name: Safe apt-get update (with sudo and stale-lock removal)
+        run: |
+          set -eux
+          # remove stale locks if present
+          sudo bash -c 'for f in /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend; do if [ -f "$f" ]; then rm -f "$f"; fi; done'
+          sudo bash -c 'dpkg --configure -a || true'
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y
+
+      - name: Install minimal debug tools
+        run: |
+          set -eux
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl git
+          python3 -m pip install --upgrade pip setuptools wheel
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: DNS and quick connectivity checks
+        run: |
+          set -eux
+          python - <<'PY'
+import socket
+hosts = ["api.groq.ai", "groq.ai", "www.google.com"]
+for h in hosts:
+    try:
+        print(h, "->", socket.gethostbyname(h))
+    except Exception as e:
+        print(h, "resolution failed:", e)
+PY
+          curl --fail --retry 3 --retry-delay 2 -I https://api.groq.ai || echo "api.groq.ai HEAD check failed or blocked"
+
+      - name: Run groq generator (defensive, write logs)
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -eux
+          mkdir -p debug-logs
+          timestamp=$(date -u +"%Y%m%dT%H%M%SZ")
+          LOGFILE=debug-logs/groq-generate-$timestamp.log
+          echo "Start: $(date -u)" | tee -a "$LOGFILE"
+          if [ -f generator/groq_generate.py ]; then
+            n=0; max=3
+            until [ $n -ge $max ]; do
+              python generator/groq_generate.py 2>&1 | tee -a "$LOGFILE" && break
+              n=$((n+1))
+              echo "Attempt $n/$max failed" | tee -a "$LOGFILE"
+              sleep $((n*5))
+            done
+            if [ $n -ge $max ]; then
+              echo "groq_generate failed after $max attempts" | tee -a "$LOGFILE"
+              exit 1
+            fi
+          else
+            echo "generator/groq_generate.py not found" | tee -a "$LOGFILE"
+            ls -la
+            exit 2
+          fi
+
+      - name: Collect debug info
+        run: |
+          set -eux
+          echo "--- ENV (filtered) ---" > debug-logs/env.txt
+          env | egrep -i 'GROQ|GEMINI|HTTP|HTTPS|PROXY|DNS|HOST' >> debug-logs/env.txt || true
+          cat /etc/resolv.conf > debug-logs/resolv.txt || true
+          ss -tunap > debug-logs/ss.txt || true
+          tar -czf debug-logs.tar.gz debug-logs || true
+
+      - name: Upload debug logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.DEBUG_ARTIFACT_NAME }}
+          path: |
+            debug-logs
+            debug-logs.tar.gz
