@@ -1,45 +1,61 @@
-# ====================================================
-# Encyclopedia Generator — Runtime Configuration
-# ====================================================
+model: gpt-oss-20b
 
-# OpenAI model used for generation
-model: gpt-4o-mini
-
-# Temperature for creativity vs. stability
-temperature: 0.7
-
-# Max tokens allocated per book generation
-max_tokens: 6000
-
-# Retry behavior for transient failures
-retry:
-  enabled: true
-  attempts: 3
-  delay_seconds: 3
-
-# Mock mode (for CI dry-runs and debugging)
-mock_mode:
-  enabled: false
-  sample_output_path: "generator/mock/mock_output.md"
-
-# Small language handling
-small_languages:
+languages:
+  - Python
+  - JavaScript
+  - Java
+  - C++
+  - C
+  - Go
+  - Rust
+  - C#
+  - PHP
+  - Ruby
+  - Swift
+  - Kotlin
+  - TypeScript
+  - Scala
+  - Haskell
   - Lua
-  - Nim
+  - R
+  - Dart
+  - Elixir
+  - Erlang
+  - Bash
+  - Shell
+  - SQL
+  - HTML
+  - CSS
+  - Perl
+  - Objective-C
+  - MATLAB
+  - Fortran
+  - Assembly
   - Crystal
-  - Smalltalk
-  - Haxe
+  - F#
+  - OCaml
+  - Lisp
+  - Prolog
+  - Julia
+  - Visual Basic
+  - Clojure
+  - Scheme
+  - PowerShell
+  - Apex
+  - Solidity
+  - V
   - Zig
+  - Ada
+  - COBOL
+  - Pascal
+  - Tcl
+  - Hack
+  - Nim
+  - Smalltalk
+  - Logo
+  - ReasonML
+  - Q#
+  - Awk
   - Racket
-
-max_small_per_run: 2
-
-# Output directory
-output_directory: "output"
-
-# Prompt file location
-prompt_file: "generator/prompts/master_prompt.txt"
-
-# Files to track progress
-language_list: "languages.txt"
-completed_list: "completed_languages"
+  - ABAP
+  - X++
