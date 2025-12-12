@@ -1,0 +1,124 @@
+name: Groq + Gemini Debug (DNS override)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  DEBUG_ARTIFACT_NAME: groq-gemini-debug-logs
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: true
+
+      - name: Show git status & recent commits
+        run: |
+          git rev-parse --abbrev-ref HEAD || true
+          git rev-parse HEAD || true
+          git --no-pager log -n 5 --pretty=oneline || true
+
+      - name: Prepare safe DNS override (backup & apply)
+        run: |
+          set -eux
+          # backup original resolv.conf to /tmp (unique per-run)
+          ORIG="/tmp/resolv.conf.$(date -u +%s)"
+          sudo cp /etc/resolv.conf "${ORIG}" || true
+          echo "Backed up /etc/resolv.conf -> ${ORIG}"
+          # write a simple resolv.conf that uses Cloudflare & Google DNS
+          echo "# Temporary resolv.conf for CI run (Cloudflare + Google)" | sudo tee /etc/resolv.conf >/dev/null
+          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf >/dev/null
+          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf >/dev/null
+          echo "options edns0 trust-ad" | sudo tee -a /etc/resolv.conf >/dev/null
+          # verify resolution now works for api.groq.ai (non-fatal)
+          echo "Resolving api.groq.ai (after override):"
+          getent hosts api.groq.ai || nslookup api.groq.ai || true
+          # export backup path for later restore
+          echo "RESTORE_RESOLV=${ORIG}" >> $GITHUB_ENV
+
+      - name: Install minimal packages (curl, dnsutils)
+        run: |
+          set -eux
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl dnsutils
+
+      - name: Show environment + quick network checks
+        run: |
+          set -eux
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          echo "Attempt DNS lookup (getent + dig)"
+          getent hosts api.groq.ai || true
+          dig +short api.groq.ai || true
+          curl -I --max-time 10 https://api.groq.ai || echo "HEAD to api.groq.ai failed (may be blocked)";
+
+      - name: Run generator (defensive) and save logs
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -eux
+          mkdir -p debug-logs
+          TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+          LOGFILE=debug-logs/groq-generate-${TIMESTAMP}.log
+          echo "Start generator at $(date -u)" | tee -a "$LOGFILE"
+          if [ -f generator/groq_generate.py ]; then
+            python3 generator/groq_generate.py 2>&1 | tee -a "$LOGFILE" || true
+          else
+            echo "generator/groq_generate.py not found" | tee -a "$LOGFILE"
+            ls -la generator >> "$LOGFILE" || true
+          fi
+          echo "Generator finished (exit code captured in job logs)" | tee -a "$LOGFILE"
+
+      - name: Collect debug info
+        run: |
+          set -eux
+          mkdir -p debug-logs || true
+          echo "--- ENV (filtered) ---" > debug-logs/env.txt
+          env | egrep -i 'GROQ|GEMINI|HTTP|HTTPS|PROXY|DNS|HOST|GITHUB' >> debug-logs/env.txt || true
+          echo "--- resolv.conf (current) ---" > debug-logs/resolv.txt
+          sudo cat /etc/resolv.conf >> debug-logs/resolv.txt || true
+          echo "--- netstat/ss ---" > debug-logs/ss.txt
+          ss -tunap >> debug-logs/ss.txt || true
+          echo "--- ls debug-logs ---" > debug-logs/listing.txt
+          ls -la debug-logs >> debug-logs/listing.txt || true
+
+      - name: Restore original resolv.conf (always)
+        if: always()
+        run: |
+          set -eux || true
+          # read restore path written during prepare step
+          if [ -n "${RESTORE_RESOLV:-}" ]; then
+            echo "Restoring resolv.conf from ${RESTORE_RESOLV}"
+            sudo cp "${RESTORE_RESOLV}" /etc/resolv.conf || true
+          else
+            echo "No RESTORE_RESOLV found; skipping restore"
+          fi
+          echo "Verify /etc/resolv.conf after restore:"
+          sudo cat /etc/resolv.conf || true
+
+      - name: Ensure debug-logs has content (for artifact upload)
+        run: |
+          set -eux
+          if ! ls debug-logs/* >/dev/null 2>&1; then
+            echo "no debug files produced — adding sentinel" > debug-logs/sentinel.txt
+          fi
+          ls -la debug-logs || true
+
+      - name: Upload debug logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT_NAME }}
+          path: debug-logs
