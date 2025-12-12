@@ -1,31 +1,23 @@
 """
-generate_one_chapter.py
+generate_one_chapter.py (compatible with openai v0.x and v1.x+)
 
-Generates ONE fully-featured chapter for a single language and saves it as:
-  output/<Language>/chapters/<slugified-chapter-title>.md
-
-Behavior:
-- reads master prompt for system context
-- builds a user prompt instructing a single chapter output following the project's chapter template:
-    Spark & Byte dialogue, Concept, Deep dive, Examples, Line-by-line annotated code, Mermaid diagram, Exercises, Recap.
-- honors workflow env overrides:
-    FORCE_LANGUAGE (required)
-    CHAPTER_TITLE (required)
-    MODEL_OVERRIDE, TEMPERATURE_OVERRIDE, MAX_TOKENS_OVERRIDE (optional)
-- writes file and exits with success or prints errors for debugging
+This script:
+- Reads env inputs (FORCE_LANGUAGE, CHAPTER_TITLE, MODEL_OVERRIDE, TEMPERATURE_OVERRIDE, MAX_TOKENS_OVERRIDE)
+- Loads master_prompt.txt as the system message if present
+- Calls OpenAI using the new client API when available (openai.OpenAI) or falls back to legacy ChatCompletion
+- Saves the resulting chapter to output/<Language>/chapters/<slug>.md
+- Prints clear logs for debugging in Actions
 """
 
 import os
 import re
-import json
-from pathlib import Path
 import sys
-import time
+from pathlib import Path
 
-# Optional OpenAI import - fail early if missing
+# Try importing openai; if missing, we'll error clearly
 try:
     import openai
-except Exception as e:
+except Exception:
     openai = None
 
 BASE = Path(__file__).resolve().parent.parent
@@ -39,7 +31,6 @@ MODEL_OVERRIDE = os.environ.get("MODEL_OVERRIDE", "").strip() or None
 TEMPERATURE_OVERRIDE = os.environ.get("TEMPERATURE_OVERRIDE", "").strip()
 MAX_TOKENS_OVERRIDE = os.environ.get("MAX_TOKENS_OVERRIDE", "").strip()
 
-# Helper: slugify
 def slugify(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
@@ -51,8 +42,33 @@ def read_master_prompt():
         return PROMPT_FILE.read_text(encoding="utf-8")
     return ""
 
+def pick_model_and_params(cfg_model=None):
+    model = MODEL_OVERRIDE or cfg_model or "gpt-4o-mini"
+    try:
+        temp = float(TEMPERATURE_OVERRIDE) if TEMPERATURE_OVERRIDE else 0.7
+    except:
+        temp = 0.7
+    try:
+        max_t = int(MAX_TOKENS_OVERRIDE) if MAX_TOKENS_OVERRIDE else 3000
+    except:
+        max_t = 3000
+    return model, temp, max_t
+
+def write_chapter_file(language: str, chapter_title: str, text: str) -> Path:
+    slug = slugify(chapter_title)
+    path = OUTPUT_DIR / language / "chapters"
+    path.mkdir(parents=True, exist_ok=True)
+    file_path = path / f"{slug}.md"
+    file_path.write_text(text, encoding="utf-8")
+    return file_path
+
+def build_messages(system_prompt: str, user_prompt: str):
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
 def build_user_prompt(language: str, chapter_title: str) -> str:
-    # Instruct the model to produce a single chapter only, follow chapter template.
     return (
         f"Produce a single chapter for the programming-language encyclopedia for '{language}'.\n\n"
         f"The chapter title is: \"{chapter_title}\".\n\n"
@@ -68,47 +84,87 @@ def build_user_prompt(language: str, chapter_title: str) -> str:
         "Format requirements:\n"
         "- First line must be a level-1 heading with the chapter title.\n"
         "- Save this single chapter as the entire response (no surrounding explanation).\n\n"
-        "Now produce the chapter.\n"
+        "Now produce the chapter."
     )
 
-def pick_model_and_params(cfg_model=None):
-    model = MODEL_OVERRIDE or cfg_model or "gpt-4o-mini"
-    try:
-        temp = float(TEMPERATURE_OVERRIDE) if TEMPERATURE_OVERRIDE else 0.7
-    except:
-        temp = 0.7
-    try:
-        max_t = int(MAX_TOKENS_OVERRIDE) if MAX_TOKENS_OVERRIDE else 3000
-    except:
-        max_t = 3000
-    return model, temp, max_t
+def call_openai_new_api(system_prompt: str, user_prompt: str, model: str, temperature: float, max_tokens: int) -> str:
+    """
+    Uses the new openai.OpenAI client (openai>=1.0.0)
+    Example usage:
+        client = openai.OpenAI(api_key=...)
+        response = client.chat.completions.create(model=..., messages=..., temperature=..., max_tokens=...)
+    """
+    print("[INFO] Using new OpenAI client API (openai>=1.0.0)")
 
-def call_openai(system_prompt: str, user_prompt: str, model: str, temperature: float, max_tokens: int) -> str:
-    if openai is None:
-        raise RuntimeError("openai package not installed in the Action runner.")
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY missing in environment.")
-    openai.api_key = key
-    # Use ChatCompletion (older style) — matches generator/generate.py
+    # Create client instance - some installs expose OpenAI as a class
+    # If openai.OpenAI exists, use it. Otherwise if openai has attribute 'OpenAI' or 'OpenAI' callable, try to instantiate.
+    client = None
+    try:
+        if hasattr(openai, "OpenAI"):
+            client = openai.OpenAI()
+        elif callable(getattr(openai, "OpenAI", None)):
+            client = openai.OpenAI()
+        else:
+            # Some environments require constructing with api_key explicitly
+            api_key = os.environ.get("OPENAI_API_KEY")
+            client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()
+    except Exception as e:
+        raise RuntimeError(f"Failed to construct OpenAI client: {e}")
+
+    messages = build_messages(system_prompt, user_prompt)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+
+    # Response shape: resp.choices[0].message.content or resp.choices[0].message['content']
+    try:
+        content = resp.choices[0].message.content
+    except Exception:
+        # fallback to dict-like access
+        try:
+            content = resp["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise RuntimeError(f"Unexpected response shape from new OpenAI API: {e}")
+    return content
+
+def call_openai_legacy(system_prompt: str, user_prompt: str, model: str, temperature: float, max_tokens: int) -> str:
+    """
+    Uses legacy openai.ChatCompletion.create(...) (openai<1.0)
+    """
+    print("[INFO] Using legacy openai.ChatCompletion API (openai<1.0)")
     resp = openai.ChatCompletion.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=build_messages(system_prompt, user_prompt),
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_tokens=max_tokens
     )
-    return resp["choices"][0]["message"]["content"]
+    # legacy shape: resp['choices'][0]['message']['content']
+    try:
+        return resp["choices"][0]["message"]["content"]
+    except Exception:
+        # attempt object attribute access
+        try:
+            return resp.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"Unexpected response shape from legacy OpenAI API: {e}")
 
-def save_chapter(language: str, chapter_title: str, text: str) -> Path:
-    slug = slugify(chapter_title)
-    path = OUTPUT_DIR / language / "chapters"
-    path.mkdir(parents=True, exist_ok=True)
-    file_path = path / f"{slug}.md"
-    file_path.write_text(text, encoding="utf-8")
-    return file_path
+def call_openai_auto(system_prompt: str, user_prompt: str, model: str, temperature: float, max_tokens: int) -> str:
+    """
+    Picks the right call depending on installed openai library.
+    """
+    if openai is None:
+        raise RuntimeError("openai package is not installed in the environment.")
+    # Prefer new API if available
+    if hasattr(openai, "OpenAI"):
+        return call_openai_new_api(system_prompt, user_prompt, model, temperature, max_tokens)
+    # else, fall back to legacy ChatCompletion if available
+    if hasattr(openai, "ChatCompletion"):
+        return call_openai_legacy(system_prompt, user_prompt, model, temperature, max_tokens)
+    # nothing matched
+    raise RuntimeError("OpenAI library installed but no compatible API entry points were found (neither OpenAI nor ChatCompletion were available).")
 
 def main():
     if not LANG:
@@ -122,26 +178,27 @@ def main():
     if not master:
         print("[WARN] master_prompt.txt missing or empty. The model will still generate but system context may be limited.")
 
-    user_p = build_user_prompt(LANG, CHAPTER_TITLE)
+    user_prompt = build_user_prompt(LANG, CHAPTER_TITLE)
     model, temp, max_t = pick_model_and_params()
 
     print(f"[INFO] Model={model} temp={temp} max_tokens={max_t}")
     print(f"[INFO] Requesting chapter: {LANG} / {CHAPTER_TITLE}")
 
     try:
-        text = call_openai(master, user_p, model, temp, max_t)
+        text = call_openai_auto(master, user_prompt, model, temp, max_t)
     except Exception as e:
         print("[ERR] OpenAI call failed:", e)
+        # Show hint for migration
+        print("\n[HINT] If you're using openai>=1.0.0, ensure the runner has network access and OPENAI_API_KEY set in secrets.")
+        print("[HINT] This script supports both legacy and new API shapes; if error persists, paste the full error here.")
         sys.exit(1)
 
     # Basic sanity check: ensure output contains a top-level heading
     if not text.strip().startswith("#"):
-        print("[WARN] Output does not start with '#'. Prepending heading.")
         text = f"# {CHAPTER_TITLE}\n\n" + text
 
-    out_path = save_chapter(LANG, CHAPTER_TITLE, text)
+    out_path = write_chapter_file(LANG, CHAPTER_TITLE, text)
     print(f"[OK] Saved chapter to {out_path}")
-    # done
     return 0
 
 if __name__ == "__main__":
