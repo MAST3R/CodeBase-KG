@@ -1,0 +1,59 @@
+name: Groq Draft Generator
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Language to generate drafts for (leave empty to generate all)"
+        required: false
+        default: ""
+      parallelism:
+        description: "How many simultaneous Groq requests (1..8)"
+        required: false
+        default: "4"
+      model:
+        description: "Groq model override (optional)"
+        required: false
+        default: ""
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tiktoken
+
+      - name: Run Groq draft generator
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          FORCE_LANGUAGE: ${{ inputs.language }}
+          PARALLELISM: ${{ inputs.parallelism }}
+          GROQ_MODEL: ${{ inputs.model }}
+        run: |
+          python generator/groq_generate.py
+
+      - name: Commit drafts (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: add groq drafts [skip ci]" || true
+            git push origin HEAD:refs/heads/${{ github.ref_name || 'main' }} || true
+          else
+            echo "No drafts to commit"
+          fi
