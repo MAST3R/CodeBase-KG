@@ -2,14 +2,14 @@
 """
 generate_chapters.py
 
-Final, corrected, router-compatible generator (stdlib-only).
+Router-compatible generator (stdlib-only).
 
 - Uses Hugging Face router endpoint: https://router.huggingface.co/v1/responses
-- OpenAI-style JSON shape (model + input + parameters).
+- OpenAI-style JSON: { "model", "input", "parameters": {...} }
 - No external deps (urllib only).
 - MOCK_MODE supported.
 - Writes to output/<TitleCaseLanguage>/Introduction.md
-- Safe retry/backoff and clear Action logs.
+- Safe retry/backoff and clear logs.
 """
 
 from __future__ import annotations
@@ -22,8 +22,9 @@ import random
 from pathlib import Path
 from datetime import datetime
 from urllib import request, error
-import yaml
 from typing import Optional, Set, Dict, Any
+
+import yaml
 
 # -------------------- CONFIG PATHS --------------------
 ROOT = Path(__file__).resolve().parent.parent
@@ -64,27 +65,28 @@ def titlecase_lang(lang: str) -> str:
         return "Unknown"
     return lang[0].upper() + lang[1:]
 
+
 def safe_filename(name: str) -> str:
     name = name.strip().replace(" ", "_")
     return "".join(c for c in name if c.isalnum() or c in "_-.")[:200]
+
 
 def read_completed() -> Set[str]:
     if not COMPLETED_LOG.exists():
         return set()
     try:
-        return set(
-            x.strip()
-            for x in COMPLETED_LOG.read_text(encoding="utf-8").splitlines()
-            if x.strip()
-        )
+        text = COMPLETED_LOG.read_text(encoding="utf-8")
+        return {x.strip() for x in text.splitlines() if x.strip()}
     except Exception:
         return set()
+
 
 def append_completed(lang: str) -> None:
     COMPLETED_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(COMPLETED_LOG, "a", encoding="utf-8") as f:
         f.write(f"{lang}
 ")
+
 
 def pick_next_language() -> Optional[str]:
     done = read_completed()
@@ -140,16 +142,14 @@ def build_prompt(language: str, chapter_title: str = "Introduction") -> str:
 # -------------------- HF ROUTER CALL (urllib) --------------------
 def hf_call(prompt: str, max_new_tokens: int = 1000, temperature: float = 0.2) -> str:
     if MOCK_MODE:
-        # Safe mock output that proves structure only
         return prompt + "
 
 # MOCK OUTPUT
 This is a mock chapter for testing."
 
-    # Hugging Face router v1, OpenAI-style schema
     url = "https://router.huggingface.co/v1/responses"
     payload: Dict[str, Any] = {
-        "model": HF_MODEL,          # e.g. "openai/gpt-oss-20b"
+        "model": HF_MODEL,      # e.g. "openai/gpt-oss-20b"
         "input": prompt,
         "parameters": {
             "max_new_tokens": max_new_tokens,
@@ -164,41 +164,40 @@ This is a mock chapter for testing."
     }
 
     backoff = INITIAL_BACKOFF
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             req = request.Request(url, data=data, headers=headers, method="POST")
             with request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 raw = resp.read().decode("utf-8")
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    return raw
 
-                # OpenAI-style: top-level "output_text" or choices-like structure
-                if isinstance(parsed, dict):
-                    if "output_text" in parsed:
-                        return parsed["output_text"]
-                    if "choices" in parsed and parsed["choices"]:
-                        choice0 = parsed["choices"][0]
-                        if isinstance(choice0, dict):
-                            return (
-                                choice0.get("message", {}).get("content")
-                                or choice0.get("text")
-                                or raw
-                            )
-                    return parsed.get("generated_text") or parsed.get("text") or raw
-
-                if isinstance(parsed, list) and parsed:
-                    first = parsed[0]
-                    if isinstance(first, dict):
-                        return (
-                            first.get("generated_text")
-                            or first.get("text")
-                            or raw
-                        )
-                    return str(first)
-
+            try:
+                parsed = json.loads(raw)
+            except Exception:
                 return raw
+
+            if isinstance(parsed, dict):
+                if "output_text" in parsed:
+                    return parsed["output_text"]
+
+                if "choices" in parsed and parsed["choices"]:
+                    choice0 = parsed["choices"][0]
+                    if isinstance(choice0, dict):
+                        msg = choice0.get("message", {})
+                        if isinstance(msg, dict) and "content" in msg:
+                            return msg["content"]
+                        if "text" in choice0:
+                            return choice0["text"]
+
+                return parsed.get("generated_text") or parsed.get("text") or raw
+
+            if isinstance(parsed, list) and parsed:
+                first = parsed[0]
+                if isinstance(first, dict):
+                    return first.get("generated_text") or first.get("text") or raw
+                return str(first)
+
+            return raw
 
         except error.HTTPError as he:
             body = he.read().decode("utf-8", errors="ignore")
@@ -215,6 +214,7 @@ This is a mock chapter for testing."
         except error.URLError as ue:
             print(f"[HF][{attempt}] URLError: {ue}", file=sys.stderr)
             sleep = backoff + random.random()
+            print(f"[HF] retrying in {sleep:.1f}s", file=sys.stderr)
             time.sleep(sleep)
             backoff *= 2
             continue
@@ -261,6 +261,7 @@ def main() -> int:
         return 3
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
