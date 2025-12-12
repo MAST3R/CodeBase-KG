@@ -1,0 +1,71 @@
+name: Gemini Polisher (safe hybrid)
+
+on:
+  workflow_dispatch:
+    inputs:
+      requests_per_day_override:
+        description: "Max requests (leave empty to use quota-derived safe value)"
+        required: false
+        default: ""
+      batch_size:
+        description: "Chapters per Gemini request (k). Start with 1, increase after tests"
+        required: false
+        default: "1"
+      model:
+        description: "Gemini model (default from secret or gemini-2.5-flash)"
+        required: false
+        default: ""
+
+jobs:
+  polish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google (service account)
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDS_JSON }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tiktoken
+
+      - name: Run Gemini polisher (safe)
+        env:
+          GEMINI_MODEL: ${{ inputs.model }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          REQUESTS_PER_DAY_OVERRIDE: ${{ inputs.requests_per_day_override }}
+          # Your Gemini limits — keep these in sync if they change
+          GEMINI_RPD: "20"
+          GEMINI_RPM: "5"
+          GEMINI_TPM: "250000"
+          # Google auth token (set by google-github-actions/auth action)
+          GOOGLE_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          # ensure the auth action exposed the token (action sets GOOGLE_ACCESS_TOKEN in env)
+          export GOOGLE_ACCESS_TOKEN="${{ steps.auth.outputs.access_token || env.GOOGLE_ACCESS_TOKEN }}"
+          python generator/gemini_polish.py
+          
+      - name: Commit polished files & logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: add polished chapters [skip ci]" || true
+            git push origin HEAD:refs/heads/${{ github.ref_name || 'main' }} || true
+          else
+            echo "No polished output to commit"
+          fi
