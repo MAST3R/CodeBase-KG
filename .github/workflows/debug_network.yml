@@ -1,15 +1,9 @@
+# after verifying test success
+cat > .github/workflows/groq-gemini-debug.yml <<'YAML'
 name: Groq + Gemini Debug Runner
 
-# Top-level manual trigger — this is what creates the "Run workflow" button
 on:
   workflow_dispatch: {}
-
-# Optional: keep push triggers if you want CI runs on push too
-# on:
-#   push:
-#     branches:
-#       - main
-#       - deploy
 
 concurrency:
   group: groq-gemini-debug
@@ -44,10 +38,8 @@ jobs:
       - name: Safe apt-get update (with sudo and stale-lock removal)
         run: |
           set -eux
-          # remove stale locks if present
           sudo bash -c 'for f in /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend; do if [ -f "$f" ]; then rm -f "$f"; fi; done'
           sudo bash -c 'dpkg --configure -a || true'
-          # run update with reduced retries
           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y
 
       - name: Install minimal debug tools
@@ -120,3 +112,8 @@ PY
           path: |
             debug-logs
             debug-logs.tar.gz
+YAML
+
+git add .github/workflows/groq-gemini-debug.yml
+git commit -m "chore: restore hardened Groq+Gemini debug workflow"
+git push origin main
