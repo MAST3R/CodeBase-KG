@@ -4,8 +4,8 @@ generate_chapters.py
 
 Final, corrected, router-compatible generator (stdlib-only).
 
-- Uses Hugging Face router endpoint: https://router.huggingface.co/hf-inference/models/<model>
-- Text-generation JSON shape only.
+- Uses Hugging Face router endpoint: https://router.huggingface.co/v1/responses
+- OpenAI-style JSON shape (model + input + parameters).
 - No external deps (urllib only).
 - MOCK_MODE supported.
 - Writes to output/<TitleCaseLanguage>/Introduction.md
@@ -72,14 +72,19 @@ def read_completed() -> Set[str]:
     if not COMPLETED_LOG.exists():
         return set()
     try:
-        return set(x.strip() for x in COMPLETED_LOG.read_text(encoding="utf-8").splitlines() if x.strip())
+        return set(
+            x.strip()
+            for x in COMPLETED_LOG.read_text(encoding="utf-8").splitlines()
+            if x.strip()
+        )
     except Exception:
         return set()
 
 def append_completed(lang: str) -> None:
     COMPLETED_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(COMPLETED_LOG, "a", encoding="utf-8") as f:
-        f.write(f"{lang}\n")
+        f.write(f"{lang}
+")
 
 def pick_next_language() -> Optional[str]:
     done = read_completed()
@@ -92,23 +97,43 @@ def pick_next_language() -> Optional[str]:
 def build_prompt(language: str, chapter_title: str = "Introduction") -> str:
     date_iso = datetime.utcnow().date().isoformat()
     frontmatter = (
-        "---\n"
-        f'title: "{chapter_title}"\n'
-        f'language: "{language}"\n'
-        f'date: "{date_iso}"\n'
-        "---\n\n"
+        "---
+"
+        f'title: "{chapter_title}"
+'
+        f'language: "{language}"
+'
+        f'date: "{date_iso}"
+'
+        "---
+
+"
     )
     body = (
-        f"# {chapter_title}\n\n"
-        "Write a complete, production-ready Obsidian Markdown chapter.\n\n"
-        "Rules:\n"
-        "- Warm, analogy-rich, teen-friendly voice.\n"
-        "- Include Spark & Byte dialogue.\n"
-        "- Include Mermaid diagrams when useful.\n"
-        "- Add code examples with explanations.\n"
-        "- Provide 2-3 exercises with collapsible answers.\n"
-        "- End with a clear recap and next steps.\n\n"
-        "<!-- Begin chapter content -->\n\n"
+        f"# {chapter_title}
+
+"
+        "Write a complete, production-ready Obsidian Markdown chapter.
+
+"
+        "Rules:
+"
+        "- Warm, analogy-rich, teen-friendly voice.
+"
+        "- Include Spark & Byte dialogue.
+"
+        "- Include Mermaid diagrams when useful.
+"
+        "- Add code examples with explanations.
+"
+        "- Provide 2-3 exercises with collapsible answers.
+"
+        "- End with a clear recap and next steps.
+
+"
+        "<!-- Begin chapter content -->
+
+"
     )
     return frontmatter + body
 
@@ -116,20 +141,26 @@ def build_prompt(language: str, chapter_title: str = "Introduction") -> str:
 def hf_call(prompt: str, max_new_tokens: int = 1000, temperature: float = 0.2) -> str:
     if MOCK_MODE:
         # Safe mock output that proves structure only
-        return prompt + "\n\n# MOCK OUTPUT\nThis is a mock chapter for testing."
+        return prompt + "
 
-    url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
+# MOCK OUTPUT
+This is a mock chapter for testing."
+
+    # Hugging Face router v1, OpenAI-style schema
+    url = "https://router.huggingface.co/v1/responses"
     payload: Dict[str, Any] = {
-        "inputs": prompt,
+        "model": HF_MODEL,          # e.g. "openai/gpt-oss-20b"
+        "input": prompt,
         "parameters": {
             "max_new_tokens": max_new_tokens,
-            "temperature": temperature
-        }
+            "temperature": temperature,
+        },
     }
+
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     backoff = INITIAL_BACKOFF
@@ -141,27 +172,39 @@ def hf_call(prompt: str, max_new_tokens: int = 1000, temperature: float = 0.2) -
                 try:
                     parsed = json.loads(raw)
                 except Exception:
-                    # Non-JSON response — return raw body
                     return raw
 
-                # Common router: list of dicts with generated_text
+                # OpenAI-style: top-level "output_text" or choices-like structure
+                if isinstance(parsed, dict):
+                    if "output_text" in parsed:
+                        return parsed["output_text"]
+                    if "choices" in parsed and parsed["choices"]:
+                        choice0 = parsed["choices"][0]
+                        if isinstance(choice0, dict):
+                            return (
+                                choice0.get("message", {}).get("content")
+                                or choice0.get("text")
+                                or raw
+                            )
+                    return parsed.get("generated_text") or parsed.get("text") or raw
+
                 if isinstance(parsed, list) and parsed:
                     first = parsed[0]
                     if isinstance(first, dict):
-                        return first.get("generated_text") or first.get("text") or raw
-                    else:
-                        return str(first)
-                if isinstance(parsed, dict):
-                    return parsed.get("generated_text") or parsed.get("text") or raw
+                        return (
+                            first.get("generated_text")
+                            or first.get("text")
+                            or raw
+                        )
+                    return str(first)
+
                 return raw
 
         except error.HTTPError as he:
             body = he.read().decode("utf-8", errors="ignore")
             print(f"[HF][{attempt}] HTTPError {he.code}: {body}", file=sys.stderr)
-            # Fatal statuses
             if he.code in (401, 403, 404):
                 raise
-            # Retryable statuses
             if he.code in (429, 500, 502, 503):
                 sleep = backoff + random.random()
                 print(f"[HF] retrying in {sleep:.1f}s", file=sys.stderr)
