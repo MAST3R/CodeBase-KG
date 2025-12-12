@@ -1,0 +1,87 @@
+name: Groq + Gemini Inspect (repo & env snapshot)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          echo "RUNNER_OS=$RUNNER_OS"
+          uname -a
+          lsb_release -a || true
+          echo "PWD: $(pwd)"
+          echo "TREE (top 4 levels)"
+          find . -maxdepth 4 -type d -print -o -type f -print | sed -n '1,200p' || true
+
+      - name: List workflows and show their top lines
+        run: |
+          echo "=== .github/workflows files ==="
+          ls -la .github/workflows || echo "no workflows folder"
+          for f in .github/workflows/*; do
+            echo "---- $f ----"
+            sed -n '1,120p' "$f" || true
+            echo ""
+          done
+
+      - name: Check for generator script and show head/tail if present
+        run: |
+          echo "checking generator/groq_generate.py"
+          if [ -f generator/groq_generate.py ]; then
+            echo "FOUND generator/groq_generate.py — showing first 200 lines"
+            sed -n '1,200p' generator/groq_generate.py || true
+            echo "---- tail 200 ----"
+            tail -n 200 generator/groq_generate.py || true
+          else
+            echo "generator/groq_generate.py NOT FOUND"
+            echo "Listing generator/ directory"
+            ls -la generator || true
+          fi
+
+      - name: Check secrets presence (masked — will not print values)
+        run: |
+          if [ -z "${GROQ_API_KEY:-}" ]; then echo "GROQ_API_KEY: MISSING"; else echo "GROQ_API_KEY: PRESENT"; fi
+          if [ -z "${GEMINI_API_KEY:-}" ]; then echo "GEMINI_API_KEY: MISSING"; else echo "GEMINI_API_KEY: PRESENT"; fi
+          echo "GITHUB_TOKEN presence (built-in):"
+          if [ -z "${GITHUB_TOKEN:-}" ]; then echo "GITHUB_TOKEN: MISSING"; else echo "GITHUB_TOKEN: PRESENT"; fi
+
+      - name: Make debug-logs and write snapshot files
+        run: |
+          set -eux
+          mkdir -p debug-logs
+          echo "date: $(date -u)" > debug-logs/inspect_summary.txt
+          echo "pwd: $(pwd)" >> debug-logs/inspect_summary.txt
+          echo "ls -la root:" >> debug-logs/inspect_summary.txt
+          ls -la >> debug-logs/inspect_summary.txt || true
+          echo "" >> debug-logs/inspect_summary.txt
+          echo "workflows listing:" >> debug-logs/inspect_summary.txt
+          ls -la .github/workflows >> debug-logs/inspect_summary.txt || true
+          # also copy any generator log if present
+          if [ -f debug-logs/groq-generate-*.log ]; then
+            echo "found prior logs" >> debug-logs/inspect_summary.txt || true
+          fi
+          # create a small debug file
+          echo "files in debug-logs:" > debug-logs/files.txt
+          ls -la debug-logs >> debug-logs/files.txt || true
+
+      - name: Show debug-logs contents (job log)
+        run: |
+          echo "=== debug-logs listing (job log) ==="
+          ls -la debug-logs || echo "debug-logs missing"
+          for f in debug-logs/* 2>/dev/null || true; do
+            echo "---- $f ----"
+            sed -n '1,200p' "$f" || true
+            echo ""
+          done
+
+      - name: Upload inspect artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: groq-gemini-inspect-logs
+          path: debug-logs
