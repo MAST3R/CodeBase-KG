@@ -52,18 +52,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: DNS and quick connectivity checks
+      - name: DNS and quick connectivity checks (one-liners)
         run: |
           set -eux
-          python - <<'PY'
-import socket
-hosts = ["api.groq.ai", "groq.ai", "www.google.com"]
-for h in hosts:
-    try:
-        print(h, "->", socket.gethostbyname(h))
-    except Exception as e:
-        print(h, "resolution failed:", e)
-PY
+          python3 -c "import socket,sys; hosts=['api.groq.ai','groq.ai','www.google.com']; \
+for h in hosts: 
+    try: 
+        print(h+' -> '+socket.gethostbyname(h))
+    except Exception as e: 
+        print(h+' resolution failed: '+str(e))"
           curl --fail --retry 3 --retry-delay 2 -I https://api.groq.ai || echo "api.groq.ai HEAD check failed or blocked"
 
       - name: Run groq generator (defensive, write logs)
