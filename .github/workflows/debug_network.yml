@@ -1,0 +1,32 @@
+name: Debug Network to Groq
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print environment
+        run: |
+          echo "Runner: $(uname -a)"
+          echo "Python: $(python --version || true)"
+
+      - name: DNS lookup (dig or nslookup)
+        run: |
+          apt-get update -y
+          apt-get install -y dnsutils
+          echo "nslookup api.groq.ai"
+          nslookup api.groq.ai || true
+          echo "dig api.groq.ai"
+          dig api.groq.ai +short || true
+
+      - name: Curl test (connectivity)
+        run: |
+          echo "curl -Iv https://api.groq.ai/v1/generate (expect 4xx/401 or success if resolves)"
+          curl -Iv https://api.groq.ai/v1/generate || true
+
+      - name: Trace route
+        run: |
+          apt-get install -y traceroute
+          traceroute -n api.groq.ai || true
