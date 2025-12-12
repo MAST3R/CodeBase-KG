@@ -1,4 +1,4 @@
-name: Groq + Gemini Inspect (repo & env snapshot)
+name: Groq + Gemini Inspect (repo & env snapshot) - fixed
 
 on:
   workflow_dispatch: {}
@@ -18,7 +18,7 @@ jobs:
           lsb_release -a || true
           echo "PWD: $(pwd)"
           echo "TREE (top 4 levels)"
-          find . -maxdepth 4 -type d -print -o -type f -print | sed -n '1,200p' || true
+          find . -maxdepth 4 -print | sed -n '1,200p' || true
 
       - name: List workflows and show their top lines
         run: |
@@ -57,28 +57,42 @@ jobs:
           mkdir -p debug-logs
           echo "date: $(date -u)" > debug-logs/inspect_summary.txt
           echo "pwd: $(pwd)" >> debug-logs/inspect_summary.txt
-          echo "ls -la root:" >> debug-logs/inspect_summary.txt
-          ls -la >> debug-logs/inspect_summary.txt || true
           echo "" >> debug-logs/inspect_summary.txt
           echo "workflows listing:" >> debug-logs/inspect_summary.txt
           ls -la .github/workflows >> debug-logs/inspect_summary.txt || true
-          # also copy any generator log if present
-          if [ -f debug-logs/groq-generate-*.log ]; then
-            echo "found prior logs" >> debug-logs/inspect_summary.txt || true
-          fi
-          # create a small debug file
+          echo "" >> debug-logs/inspect_summary.txt
+          echo "root listing (top):" >> debug-logs/inspect_summary.txt
+          ls -la | sed -n '1,200p' >> debug-logs/inspect_summary.txt || true
+          echo "" >> debug-logs/inspect_summary.txt
+          echo "generator directory listing:" >> debug-logs/inspect_summary.txt
+          ls -la generator || true
+          # also create a small debug file
           echo "files in debug-logs:" > debug-logs/files.txt
           ls -la debug-logs >> debug-logs/files.txt || true
 
-      - name: Show debug-logs contents (job log)
+      - name: Show debug-logs contents (job log) - safe
         run: |
           echo "=== debug-logs listing (job log) ==="
           ls -la debug-logs || echo "debug-logs missing"
-          for f in debug-logs/* 2>/dev/null || true; do
-            echo "---- $f ----"
-            sed -n '1,200p' "$f" || true
-            echo ""
-          done
+          if ls debug-logs/* >/dev/null 2>&1; then
+            for f in debug-logs/*; do
+              echo "---- $f ----"
+              sed -n '1,200p' "$f" || echo "cannot show $f"
+              echo ""
+            done
+          else
+            echo "no files inside debug-logs"
+          fi
+
+      - name: Ensure artifact exists and upload it
+        run: |
+          echo "Ensuring debug-logs has at least one file for artifact upload"
+          # touch a sentinel if nothing else exists
+          if ! ls debug-logs/* >/dev/null 2>&1; then
+            echo "no debug files, creating sentinel" > debug-logs/sentinel.txt
+          fi
+          echo "--- debug-logs final listing ---"
+          ls -la debug-logs || true
 
       - name: Upload inspect artifact
         uses: actions/upload-artifact@v4
