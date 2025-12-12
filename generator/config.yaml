@@ -1,4 +1,4 @@
-model: open-ai/gpt-oss-20b
+model: openai/gpt-oss-20b
 
 languages:
   - Python
