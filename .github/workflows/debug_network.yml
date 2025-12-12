@@ -6,27 +6,31 @@ on:
 jobs:
   debug:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Print environment
+      - name: Check built-in tools
         run: |
-          echo "Runner: $(uname -a)"
-          echo "Python: $(python --version || true)"
+          which nslookup || true
+          which dig || true
+          which curl || true
 
-      - name: DNS lookup (dig or nslookup)
+      - name: DNS test with nslookup (if available)
         run: |
-          apt-get update -y
-          apt-get install -y dnsutils
-          echo "nslookup api.groq.ai"
-          nslookup api.groq.ai || true
-          echo "dig api.groq.ai"
-          dig api.groq.ai +short || true
+          echo "DNS test:"
+          nslookup api.groq.ai || echo "nslookup not available"
 
-      - name: Curl test (connectivity)
+      - name: Curl HTTPS connectivity test
         run: |
-          echo "curl -Iv https://api.groq.ai/v1/generate (expect 4xx/401 or success if resolves)"
-          curl -Iv https://api.groq.ai/v1/generate || true
+          echo "curl -I https://api.groq.ai/v1/generate"
+          curl -I https://api.groq.ai/v1/generate || true
 
-      - name: Trace route
+      - name: Python socket DNS resolution test
         run: |
-          apt-get install -y traceroute
-          traceroute -n api.groq.ai || true
+          python3 - << 'EOF'
+import socket
+try:
+    print("Resolving api.groq.ai...")
+    print(socket.getaddrinfo("api.groq.ai", 443))
+except Exception as e:
+    print("DNS resolution FAILED:", e)
+EOF
