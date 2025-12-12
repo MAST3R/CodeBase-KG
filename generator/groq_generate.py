@@ -1,124 +1,191 @@
+#!/usr/bin/env python3
 """
-generator/groq_generate.py
+Hardened groq_generate.py
 
-Bulk draft generator using Groq API.
-
-Behavior:
-- If FORCE_LANGUAGE env var provided, generate for that language only.
-- Otherwise iterate languages.txt.
-- Writes drafts to output/<Language>/drafts/<slug>.md
-- Writes metadata per draft with estimated token count to output/<Language>/drafts/meta/<slug>.json
-
-Environment:
-- GROQ_API_KEY (secret)
-- FORCE_LANGUAGE (optional)
-- PARALLELISM (optional int)
-- GROQ_MODEL (optional)
+- Uses environment GROQ_API_KEY (must be set as a secret in Actions)
+- Retries network calls with exponential backoff for transient DNS / network errors
+- Writes detailed logs to debug-logs/groq-generate-<timestamp>.log
+- Writes per-language drafts into output/<Lang>/drafts/
+- Does not print secrets to logs
 """
 
-import os, sys, json, time, math, concurrent.futures, textwrap, re
-from pathlib import Path
+from __future__ import annotations
+import os
+import sys
+import time
+import json
+import logging
+import pathlib
+import traceback
+from datetime import datetime
+from typing import Any, Dict, Optional
+
 import requests
+from requests.exceptions import RequestException, ConnectionError, Timeout, HTTPError
+import socket
 
-BASE = Path(__file__).resolve().parent.parent
-LANG_FILE = BASE / "languages.txt"
-PROMPT_FILE = BASE / "generator" / "prompts" / "master_prompt.txt"
-OUTPUT_DIR = BASE / "output"
+# ---------- CONFIG ----------
+GROQ_ENDPOINT = "https://api.groq.ai/v1/generate"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OUTPUT_DIR = pathlib.Path("output")
+DEBUG_DIR = pathlib.Path("debug-logs")
+MAX_RETRIES = 5
+BASE_BACKOFF = 2.0  # seconds
+TIMEOUT = 30  # requests timeout
+# list of sample languages to iterate — keep in sync with your repo's logic
+LANGUAGES = [
+    "Python","C","Java","JavaScript","PHP","C#","C++","TypeScript",
+    "Kotlin","Go","Swift","Rust","MATLAB","R","Ruby","Perl","Haskell",
+    "Lua","Objective-C","Dart","Bash"
+]
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-FORCE_LANGUAGE = os.environ.get("FORCE_LANGUAGE", "").strip() or None
-PARALLELISM = int(os.environ.get("PARALLELISM", "4"))
-GROQ_MODEL = os.environ.get("GROQ_MODEL") or "mixtral-8x7b"
+# ---------- SETUP ----------
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def slugify(s):
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s or "draft"
+ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+log_path = DEBUG_DIR / f"groq-generate-{ts}.log"
 
-def read_master_prompt():
-    if PROMPT_FILE.exists():
-        return PROMPT_FILE.read_text(encoding="utf-8")
-    return "You are an expert programming encyclopedia writer."
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(log_path, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-def read_languages():
-    if not LANG_FILE.exists():
-        return []
-    return [ln.strip() for ln in LANG_FILE.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
+logger = logging.getLogger("groq_generate")
+logger.info("Starting groq_generate.py (hardened)")
 
-def estimate_tokens(text):
-    # crude estimate: 1 token ≈ 0.75 words -> use words*1.3 as rough tokens OR use tiktoken if available
-    words = len(text.split())
-    return int(words * 1.3 + 100)  # some headroom
+if not GROQ_API_KEY:
+    logger.warning("GROQ_API_KEY not set. Calls to Groq will fail unless you set this secret.")
 
-def call_groq(prompt, model, max_tokens=5000, temperature=0.7):
-    url = "https://api.groq.ai/v1/generate"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=180)
-    r.raise_for_status()
-    js = r.json()
-    # adjust extraction depending on Groq response shape
-    text = js.get("text") or js.get("output") or ""
-    if not text:
-        # attempt common shapes
-        choices = js.get("choices")
-        if choices:
-            text = choices[0].get("text") or choices[0].get("output") or ""
-    return text or ""
+# Helper: safe request with retries/backoff
+def post_with_retries(url: str, payload: Dict[str, Any], headers: Dict[str, str], max_retries: int = MAX_RETRIES) -> Optional[requests.Response]:
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            attempt += 1
+            logger.info("POST attempt %d/%d to %s", attempt, max_retries, url)
+            resp = requests.post(url, json=payload, headers=headers, timeout=TIMEOUT)
+            resp.raise_for_status()
+            logger.info("HTTP %d received", resp.status_code)
+            return resp
+        except requests.exceptions.SSLError as e:
+            logger.error("SSL error: %s", e)
+            logger.debug(traceback.format_exc())
+            # SSL is unlikely transient; break
+            break
+        except (ConnectionError, Timeout) as e:
+            logger.warning("Network error on attempt %d: %s", attempt, e)
+            logger.debug(traceback.format_exc())
+        except HTTPError as e:
+            # Server responded with 4xx/5xx; log and decide whether to retry
+            logger.error("HTTP error: %s (status %s)", e, getattr(e.response, "status_code", None))
+            logger.debug(traceback.format_exc())
+            # Retry server errors 5xx, but stop on 4xx
+            if 500 <= getattr(e.response, "status_code", 0) < 600:
+                pass
+            else:
+                break
+        except RequestException as e:
+            # This can include name resolution issues (socket.gaierror)
+            logger.warning("RequestException on attempt %d: %s", attempt, e)
+            logger.debug(traceback.format_exc())
 
-def make_draft_for_language(lang):
-    master = read_master_prompt()
-    user_prompt = (
-        f"{master}\n\nProduce a detailed draft for the encyclopedia for language: {lang}.\n"
-        "Include chapters, but output only a single representative chapter draft as Markdown titled 'DRAFT: Example Chapter'.\n"
-        "This is a draft -- we will later polish and split.\n"
-    )
-    try:
-        text = call_groq(user_prompt, GROQ_MODEL, max_tokens=5000, temperature=0.7)
-    except Exception as e:
-        print("[ERR] Groq call failed for", lang, e)
-        text = f"# {lang} — Draft failed\n\nGroq call failed: {e}"
-    slug = slugify(f"{lang}-example")
+        backoff = BASE_BACKOFF * (2 ** (attempt - 1))
+        jitter = min(5, backoff * 0.1)
+        sleep_time = backoff + (jitter * (0.5 - (time.time() % 1)))  # tiny jitter
+        logger.info("Sleeping %.2f seconds before retry", sleep_time)
+        time.sleep(sleep_time)
+    logger.error("All %d attempts failed for %s", max_retries, url)
+    return None
+
+# Small helper to write draft file
+def write_draft(lang: str, name: str, body: str) -> None:
     out_dir = OUTPUT_DIR / lang / "drafts"
     out_dir.mkdir(parents=True, exist_ok=True)
-    md_path = out_dir / f"{slug}.md"
-    md_path.write_text(text, encoding="utf-8")
-    meta = {
-        "language": lang,
-        "slug": slug,
-        "estimated_tokens": estimate_tokens(text),
-        "model": GROQ_MODEL,
-        "timestamp": int(time.time())
-    }
-    meta_dir = out_dir / "meta"
-    meta_dir.mkdir(exist_ok=True, parents=True)
-    (meta_dir / f"{slug}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print("[OK] Wrote draft:", md_path)
-    return md_path, meta
+    path = out_dir / name
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    logger.info("Wrote draft: %s", str(path))
 
-def main():
-    langs = read_languages()
-    if FORCE_LANGUAGE:
-        langs = [FORCE_LANGUAGE]
-    if not langs:
-        print("[ERR] No languages found.")
-        return 1
-    # parallelize language drafts
-    with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLELISM) as ex:
-        futures = [ex.submit(make_draft_for_language, l) for l in langs]
-        for f in concurrent.futures.as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                print("[ERR] draft task failed:", e)
-    print("[DONE] Groq drafting finished.")
-    return 0
+# Safe resolver check (non-blocking)
+def check_dns(host: str) -> bool:
+    try:
+        socket.gethostbyname(host)
+        logger.info("Resolved %s via gethostbyname", host)
+        return True
+    except Exception as e:
+        logger.warning("DNS resolution failed for %s: %s", host, e)
+        return False
+
+# ---------- MAIN LOOP ----------
+def run_generation():
+    logger.info("Starting generation loop for %d languages", len(LANGUAGES))
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}" if GROQ_API_KEY else "",
+        "Content-Type": "application/json",
+    }
+
+    for lang in LANGUAGES:
+        logger.info("Generating draft for language: %s", lang)
+        # Optional: quick DNS sanity check
+        if not check_dns("api.groq.ai"):
+            logger.warning("api.groq.ai NOT resolvable from this environment. Retry logic will still run.")
+        payload = {
+            "model": "gpt-basic",  # replace with actual model key per your app
+            "prompt": f"Generate an example and short explanation for {lang}. Keep it concise.",
+            "max_tokens": 512,
+        }
+
+        resp = post_with_retries(GROQ_ENDPOINT, payload, headers, max_retries=MAX_RETRIES)
+        if resp is None:
+            # record failure but continue
+            logger.error("Groq generation failed for %s after retries", lang)
+            write_draft(lang, f"{lang.lower()}-error.txt", f"[ERR] Groq generation failed for {lang} at {datetime.utcnow().isoformat()}Z\nSee debug logs: {log_path}\n")
+            continue
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.error("Failed to parse JSON for %s: %s", lang, e)
+            write_draft(lang, f"{lang.lower()}-error.txt", f"[ERR] Non-JSON response for {lang}\n{resp.text[:2000]}")
+            continue
+
+        # Extract model text (adjust depending on Groq response schema)
+        text = None
+        # adapt for common response shapes
+        if isinstance(data, dict):
+            # try common keys
+            for k in ("text", "output", "result", "content"):
+                if k in data and isinstance(data[k], str):
+                    text = data[k]
+                    break
+            # some APIs nest outputs
+            if text is None and "choices" in data and isinstance(data["choices"], list):
+                first = data["choices"][0]
+                text = first.get("text") or first.get("message") or first.get("output")
+        if text is None:
+            # fallback to dumping the JSON
+            text = json.dumps(data, indent=2)[:10000]
+
+        filename = f"{lang.lower()}-example.md"
+        write_draft(lang, filename, text)
+        logger.info("Completed generation for %s", lang)
+
+    logger.info("Generation loop finished")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        run_generation()
+    except Exception as e:
+        logger.critical("Unhandled exception in groq_generate: %s", e)
+        logger.debug(traceback.format_exc())
+        # ensure log file exists and show path
+        print(f"Debug log: {log_path}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        logger.info("groq_generate.py finished successfully")
