@@ -52,15 +52,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: DNS and quick connectivity checks (one-liners)
+      - name: DNS and quick connectivity checks (robust shell)
         run: |
           set -eux
-          python3 -c "import socket,sys; hosts=['api.groq.ai','groq.ai','www.google.com']; \
-for h in hosts: 
-    try: 
-        print(h+' -> '+socket.gethostbyname(h))
-    except Exception as e: 
-        print(h+' resolution failed: '+str(e))"
+          for host in api.groq.ai groq.ai www.google.com; do
+            if getent hosts "$host" > /dev/null 2>&1; then
+              getent hosts "$host" | head -n1
+            else
+              echo "$host resolution failed"
+            fi
+          done
           curl --fail --retry 3 --retry-delay 2 -I https://api.groq.ai || echo "api.groq.ai HEAD check failed or blocked"
 
       - name: Run groq generator (defensive, write logs)
@@ -102,9 +103,3 @@ for h in hosts:
 
       - name: Upload debug logs
         uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.DEBUG_ARTIFACT_NAME }}
-          path: |
-            debug-logs
-            debug-logs.tar.gz
