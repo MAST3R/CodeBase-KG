@@ -1,241 +1,114 @@
 #!/usr/bin/env python3
 """
-generate_chapters.py (stdlib-only HTTP version)
+generate_chapters.py
 
-- Uses urllib.request for HF HTTP inference (no requests dependency)
-- Text-generation JSON shape only: {"inputs": "...", "parameters": {...}}
-- MOCK_MODE supports testing without network calls
-- Writes to output/<TitleCaseLanguage>/<ChapterTitle>.md
+FINAL VERSION — Hugging Face ROUTER endpoint
+- Works with new HF routing system
+- NO external dependencies (urllib only)
+- Text-generation JSON format ONLY
+- MOCK_MODE supported
+- Writes to output/<TitleCaseLanguage>/Introduction.md
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import json
 import time
 import random
-import json
-import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, Set
 from urllib import request, error
+import yaml
 
-# ---------- CONFIG PATHS ----------
+# -------------------- CONFIG PATHS --------------------
 ROOT = Path(__file__).resolve().parent.parent
 GEN_DIR = ROOT / "generator"
 CONFIG_PATH = GEN_DIR / "config.yaml"
+
 OUTDIR = Path(os.environ.get("OUTDIR", str(ROOT / "output")))
 COMPLETED_LOG = ROOT / "completed_languages.txt"
 
-# ---------- LOAD CONFIG ----------
+# -------------------- LOAD CONFIG --------------------
 if not CONFIG_PATH.exists():
     print(f"ERROR: Missing config file at {CONFIG_PATH}", file=sys.stderr)
     sys.exit(2)
 
-with CONFIG_PATH.open("r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f)
+cfg = yaml.safe_load(open(CONFIG_PATH, "r", encoding="utf-8"))
 
 MODEL_DEFAULT = cfg.get("model", "openai/gpt-oss-20b")
 LANGUAGES = cfg.get("languages", [])
 
-# ---------- ENV / FLAGS ----------
+# -------------------- ENV VARS --------------------
 HF_TOKEN = os.environ.get("HF_API_TOKEN", "").strip()
-HF_MODEL = os.environ.get("HF_MODEL", "").strip() or MODEL_DEFAULT
+HF_MODEL = os.environ.get("HF_MODEL", MODEL_DEFAULT).strip()
 PREVIEW_LANGUAGE = os.environ.get("PREVIEW_LANGUAGE", "").strip() or None
-MOCK_MODE = str(os.environ.get("MOCK_MODE", "false")).lower() in ("1", "true", "yes")
+MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() in ("1", "true", "yes")
+
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 5))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", 2.0))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", 60))
 
 if not MOCK_MODE and not HF_TOKEN:
-    print("ERROR: HF_API_TOKEN is required for non-mock runs.", file=sys.stderr)
+    print("ERROR: HF_API_TOKEN is required.", file=sys.stderr)
     sys.exit(2)
 
-# ---------- HELPERS ----------
-def read_completed() -> Set[str]:
+# -------------------- UTILITIES --------------------
+def titlecase_lang(lang: str) -> str:
+    return lang[:1].upper() + lang[1:] if lang else "Unknown"
+
+def safe_filename(name: str) -> str:
+    name = name.strip().replace(" ", "_")
+    return "".join(c for c in name if c.isalnum() or c in "_-.")[:200]
+
+def read_completed():
     if not COMPLETED_LOG.exists():
         return set()
     try:
-        with COMPLETED_LOG.open("r", encoding="utf-8") as f:
-            return set(line.strip() for line in f if line.strip())
-    except Exception:
+        return set(x.strip() for x in COMPLETED_LOG.read_text().splitlines() if x.strip())
+    except:
         return set()
 
-def append_completed(language: str) -> None:
-    COMPLETED_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with COMPLETED_LOG.open("a", encoding="utf-8") as f:
-        f.write(f"{language}\n")
+def append_completed(lang: str):
+    COMPLETED_LOG.write_text(
+        (COMPLETED_LOG.read_text() if COMPLETED_LOG.exists() else "") + f"{lang}\n",
+        encoding="utf-8"
+    )
 
-def pick_next_language() -> Optional[str]:
-    completed = read_completed()
-    for lang in LANGUAGES:
-        if lang not in completed:
-            return lang
+def pick_next_language():
+    done = read_completed()
+    for l in LANGUAGES:
+        if l not in done:
+            return l
     return None
 
-def safe_filename(s: str) -> str:
-    s = s.strip().replace(" ", "_")
-    keep = "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-", "."))
-    return keep[:200]
-
-def language_folder_titlecase(language: str) -> str:
-    if not language:
-        return "Unknown"
-    return language[0].upper() + language[1:]
-
-def save_markdown(language: str, chapter_title: str, content: str) -> Path:
-    safe_lang = language_folder_titlecase(language)
-    dirpath = OUTDIR / safe_lang
-    dirpath.mkdir(parents=True, exist_ok=True)
-    filename = safe_filename(chapter_title) + ".md"
-    path = dirpath / filename
-    path.write_text(content, encoding="utf-8")
-    return path
-
-# ---------- PROMPT BUILDER ----------
-def build_prompt_for_chapter(language: str, chapter_meta: Dict[str, Any]) -> str:
-    title = chapter_meta.get("title", "Introduction")
+# -------------------- PROMPT BUILDER --------------------
+def build_prompt(language: str, chapter_title="Introduction") -> str:
     date_iso = datetime.utcnow().date().isoformat()
-    frontmatter = {
-        "title": title,
-        "language": language,
-        "date": date_iso,
-    }
-    fm_yaml = "---\n" + "\n".join(f'{k}: "{v}"' for k, v in frontmatter.items()) + "\n---\n\n"
-    guidance = (
-        "Write a complete, production-ready Obsidian Markdown chapter.\n\n"
-        "Style rules:\n"
-        "- Warm, analogy-rich, teen-friendly voice (inverse tone shift as topics progress).\n"
-        "- Include a short Spark & Byte dialogue (two characters) that teases the core concept.\n"
-        "- Use Mermaid diagrams when helpful (provide the diagram code block).\n"
-        "- For code examples: include line-by-line commentary as inline comments or adjacent explanation.\n"
-        "- Provide 2-3 practical exercises and hide answers in collapsible sections.\n"
-        "- End with a concise recap and recommended next steps.\n"
-        "- Do NOT include any meta-text about prompts, 'as an AI', or internal tool details.\n\n"
+
+    frontmatter = (
+        "---\n"
+        f'title: "{chapter_title}"\n'
+        f'language: "{language}"\n'
+        f'date: "{date_iso}"\n'
+        "---\n\n"
     )
-    footer = "\n\n<!-- Begin chapter content -->\n\n"
-    prompt = f"{fm_yaml}# {title}\n\n{guidance}{footer}"
-    return prompt
 
-# ---------- HF HTTP CALL (urllib, text-generation only) ----------
-def hf_textgen_http_urllib(prompt: str, max_new_tokens: int = 300, temperature: float = 0.2) -> Dict[str, Any]:
-    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-        },
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            raw = resp.read()
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except Exception:
-                return {"generated_text": raw.decode("utf-8")}
-    except error.HTTPError as he:
-        # surface the HTTP status code and body for debugging
-        body = he.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTPError {he.code}: {body}") from he
-    except error.URLError as ue:
-        raise RuntimeError(f"URLError: {ue}") from ue
+    content = (
+        f"# {chapter_title}\n\n"
+        "Write a complete, production-ready Obsidian Markdown chapter.\n\n"
+        "Rules:\n"
+        "- Warm, analogy-rich, teen-friendly voice.\n"
+        "- Include Spark & Byte dialogue.\n"
+        "- Include Mermaid diagrams when useful.\n"
+        "- Add code examples with explanations.\n"
+        "- Include exercises with collapsible answers.\n"
+        "- End with a recap.\n\n"
+        "<!-- Begin chapter content -->\n\n"
+    )
 
-# ---------- CALL MODEL (retries/backoff) ----------
-def call_model(prompt: str, max_tokens: int = 1200, temperature: float = 0.2) -> Dict[str, str]:
-    if MOCK_MODE:
-        content = (
-            prompt
-            + "\n\n# MOCK CHAPTER\n\nThis content was generated in MOCK_MODE for local testing.\n\n"
-            "## Example\n\n```python\n# mock example\nprint('hello mock')\n```\n"
-        )
-        return {"content": content}
+    return frontmatter + content
 
-    backoff = INITIAL_BACKOFF
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            data = hf_textgen_http_urllib(prompt, max_new_tokens=max_tokens, temperature=temperature)
-            text = ""
-            if isinstance(data, list) and data:
-                first = data[0]
-                if isinstance(first, dict):
-                    text = first.get("generated_text") or first.get("text") or first.get("content") or str(first)
-                else:
-                    text = str(first)
-            elif isinstance(data, dict):
-                if "generated_text" in data or "text" in data or "content" in data:
-                    text = data.get("generated_text") or data.get("text") or data.get("content") or str(data)
-                elif "results" in data and isinstance(data["results"], list) and data["results"]:
-                    first = data["results"][0]
-                    if isinstance(first, dict):
-                        text = first.get("generated_text") or first.get("text") or first.get("content") or str(first)
-                    else:
-                        text = str(first)
-                else:
-                    text = str(data)
-            else:
-                text = str(data)
-            if not isinstance(text, str):
-                text = str(text)
-            return {"content": text}
-        except Exception as e:
-            msg = str(e).lower()
-            print(f"[HF_HTTP][attempt {attempt}/{MAX_RETRIES}] {e}", file=sys.stderr)
-            if any(tok in msg for tok in ("401", "403", "404")):
-                raise
-            if any(tok in msg for tok in ("429", "rate", "limit", "timeout", "temporarily unavailable", "503")):
-                sleep_time = backoff + random.random()
-                print(f"[HF_HTTP] transient error sleeping {sleep_time:.1f}s", file=sys.stderr)
-                time.sleep(sleep_time)
-                backoff *= 2
-                continue
-            raise
-    raise RuntimeError("Max retries reached while calling HF Inference HTTP API")
-
-# ---------- CORE GENERATION ----------
-def generate_for_language(language: str) -> Path:
-    chapter_meta = {"title": "Introduction", "notes": "Auto-generated one-chapter run"}
-    prompt = build_prompt_for_chapter(language, chapter_meta)
-    print(f"[GEN] Sending prompt for language='{language}' (prompt length {len(prompt)} chars)...")
-    resp = call_model(prompt, max_tokens=1200, temperature=0.2)
-    md = resp.get("content", "")
-    if not md.strip().startswith("---"):
-        md = prompt + md
-    path = save_markdown(language, chapter_meta["title"], md)
-    print(f"[GEN] Saved chapter to: {path}")
-    return path
-
-# ---------- CLI / MAIN ----------
-def main() -> int:
-    if PREVIEW_LANGUAGE:
-        lang = PREVIEW_LANGUAGE
-        print(f"[MAIN] PREVIEW_LANGUAGE override detected: {lang}")
-    else:
-        lang = pick_next_language()
-        print(f"[MAIN] Picked next language: {lang}")
-
-    if not lang:
-        print("[MAIN] No languages left to process.")
-        return 0
-
-    try:
-        outpath = generate_for_language(lang)
-        if not MOCK_MODE:
-            append_completed(lang)
-            print(f"[MAIN] Appended '{lang}' to {COMPLETED_LOG}")
-        else:
-            print("[MAIN] MOCK_MODE ON — not appending completed log.")
-    except Exception as e:
-        print(f"[MAIN] ERROR during generation: {e}", file=sys.stderr)
-        return 3
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# -------------------- HF ROUTER CALL --------------------
+de
